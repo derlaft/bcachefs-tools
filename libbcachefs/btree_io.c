@@ -885,11 +885,12 @@ int bch2_btree_node_read_done(struct bch_fs *c, struct bch_dev *ca,
 
 	btree_err_on(le64_to_cpu(b->data->magic) != bset_magic(c),
 		     BTREE_ERR_MUST_RETRY, c, ca, b, NULL,
-		     "bad magic");
+		     "bad magic: want %llx, got %llx",
+		     bset_magic(c), le64_to_cpu(b->data->magic));
 
 	btree_err_on(!b->data->keys.seq,
 		     BTREE_ERR_MUST_RETRY, c, ca, b, NULL,
-		     "bad btree header");
+		     "bad btree header: seq 0");
 
 	if (b->key.k.type == KEY_TYPE_btree_ptr_v2) {
 		struct bch_btree_ptr_v2 *bp =
@@ -927,7 +928,7 @@ int bch2_btree_node_read_done(struct bch_fs *c, struct bch_dev *ca,
 					"error decrypting btree node: %i", ret))
 				goto fsck_err;
 
-			btree_err_on(btree_node_is_extents(b) &&
+			btree_err_on(btree_node_type_is_extents(btree_node_type(b)) &&
 				     !BTREE_NODE_NEW_EXTENT_OVERWRITE(b->data),
 				     BTREE_ERR_FATAL, c, NULL, b, NULL,
 				     "btree node does not have NEW_EXTENT_OVERWRITE set");

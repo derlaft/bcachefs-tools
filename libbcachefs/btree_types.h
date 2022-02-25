@@ -343,12 +343,20 @@ struct btree_insert_entry {
 	unsigned		flags;
 	u8			bkey_type;
 	enum btree_id		btree_id:8;
-	u8			level;
+	u8			level:4;
 	bool			cached:1;
 	bool			insert_trigger_run:1;
 	bool			overwrite_trigger_run:1;
+	/*
+	 * @old_k may be a key from the journal; @old_btree_u64s always refers
+	 * to the size of the key being overwritten in the btree:
+	 */
+	u8			old_btree_u64s;
 	struct bkey_i		*k;
 	struct btree_path	*path;
+	/* key being overwritten: */
+	struct bkey		old_k;
+	const struct bch_val	*old_v;
 	unsigned long		ip_allocated;
 };
 
@@ -585,24 +593,9 @@ static inline enum btree_node_type btree_node_type(struct btree *b)
 	return __btree_node_type(b->c.level, b->c.btree_id);
 }
 
-static inline bool btree_node_type_is_extents(enum btree_node_type type)
-{
-	switch (type) {
-	case BKEY_TYPE_extents:
-	case BKEY_TYPE_reflink:
-		return true;
-	default:
-		return false;
-	}
-}
-
-static inline bool btree_node_is_extents(struct btree *b)
-{
-	return btree_node_type_is_extents(btree_node_type(b));
-}
-
 #define BTREE_NODE_TYPE_HAS_TRANS_TRIGGERS		\
 	((1U << BKEY_TYPE_extents)|			\
+	 (1U << BKEY_TYPE_alloc)|			\
 	 (1U << BKEY_TYPE_inodes)|			\
 	 (1U << BKEY_TYPE_stripes)|			\
 	 (1U << BKEY_TYPE_reflink)|			\
@@ -617,6 +610,16 @@ static inline bool btree_node_is_extents(struct btree *b)
 #define BTREE_NODE_TYPE_HAS_TRIGGERS			\
 	(BTREE_NODE_TYPE_HAS_TRANS_TRIGGERS|		\
 	 BTREE_NODE_TYPE_HAS_MEM_TRIGGERS)
+
+#define BTREE_ID_IS_EXTENTS				\
+	((1U << BTREE_ID_extents)|			\
+	 (1U << BTREE_ID_reflink)|			\
+	 (1U << BTREE_ID_freespace))
+
+static inline bool btree_node_type_is_extents(enum btree_node_type type)
+{
+	return (1U << type) & BTREE_ID_IS_EXTENTS;
+}
 
 #define BTREE_ID_HAS_SNAPSHOTS				\
 	((1U << BTREE_ID_extents)|			\

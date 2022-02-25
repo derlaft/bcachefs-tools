@@ -16,6 +16,7 @@
 #include "journal_io.h"
 #include "journal_reclaim.h"
 #include "journal_seq_blacklist.h"
+#include "lru.h"
 #include "move.h"
 #include "quota.h"
 #include "recovery.h"
@@ -92,6 +93,24 @@ size_t bch2_journal_key_search(struct journal_keys *journal_keys,
 	       __journal_key_cmp(id, level, pos, &journal_keys->d[l - 1]) <= 0);
 
 	return l;
+}
+
+struct bkey_i *bch2_journal_keys_peek(struct bch_fs *c, enum btree_id btree_id,
+				      unsigned level, struct bpos pos)
+{
+	struct journal_keys *keys = &c->journal_keys;
+	struct journal_key *end = keys->d + keys->nr;
+	struct journal_key *k = keys->d +
+		bch2_journal_key_search(keys, btree_id, level, pos);
+
+	while (k < end && k->overwritten)
+		k++;
+
+	if (k < end &&
+	    k->btree_id	== btree_id &&
+	    k->level	== level)
+		return k->k;
+	return NULL;
 }
 
 static void journal_iter_fix(struct bch_fs *c, struct journal_iter *iter, unsigned idx)
@@ -990,8 +1009,8 @@ int bch2_fs_recovery(struct bch_fs *c)
 			bch_info(c, "filesystem version is prior to subvol_dirent - upgrading");
 			c->opts.version_upgrade = true;
 			c->opts.fsck		= true;
-		} else if (c->sb.version < bcachefs_metadata_version_inode_v2) {
-			bch_info(c, "filesystem version is prior to inode_v2 - upgrading");
+		} else if (c->sb.version < bcachefs_metadata_version_freespace) {
+			bch_info(c, "filesystem version is prior to freespace - upgrading");
 			c->opts.version_upgrade = true;
 		}
 	}
@@ -1100,7 +1119,7 @@ use_clean:
 	err = "error reading allocation information";
 
 	down_read(&c->gc_lock);
-	ret = bch2_alloc_read(c, false, false);
+	ret = bch2_alloc_read(c);
 	up_read(&c->gc_lock);
 
 	if (ret)
@@ -1128,17 +1147,32 @@ use_clean:
 		bool metadata_only = c->opts.norecovery;
 
 		bch_info(c, "checking allocations");
-		err = "error in mark and sweep";
+		err = "error checking allocations";
 		ret = bch2_gc(c, true, metadata_only);
 		if (ret)
 			goto err;
 		bch_verbose(c, "done checking allocations");
 	}
 
+	if (c->opts.fsck &&
+	    c->sb.version >= bcachefs_metadata_version_freespace) {
+		bch_info(c, "checking need_discard and freespace btrees");
+		err = "error checking need_discard and freespace btrees";
+		ret = bch2_check_alloc_info(c, true);
+		if (ret)
+			goto err;
+
+		ret = bch2_check_lrus(c, true);
+		if (ret)
+			goto err;
+		bch_verbose(c, "done checking need_discard and freespace btrees");
+	}
+
 	bch2_stripes_heap_start(c);
 
 	clear_bit(BCH_FS_REBUILD_REPLICAS, &c->flags);
 	set_bit(BCH_FS_INITIAL_GC_DONE, &c->flags);
+	set_bit(BCH_FS_MAY_GO_RW, &c->flags);
 
 	/*
 	 * Skip past versions that might have possibly been used (as nonces),
@@ -1157,6 +1191,11 @@ use_clean:
 		goto err;
 	if (c->opts.verbose || !c->sb.clean)
 		bch_info(c, "journal replay done");
+
+	err = "error initializing freespace";
+	ret = bch2_fs_freespace_init(c);
+	if (ret)
+		goto err;
 
 	if (c->sb.version < bcachefs_metadata_version_snapshot_2) {
 		bch2_fs_lazy_rw(c);
@@ -1299,6 +1338,7 @@ int bch2_fs_initialize(struct bch_fs *c)
 	mutex_unlock(&c->sb_lock);
 
 	set_bit(BCH_FS_INITIAL_GC_DONE, &c->flags);
+	set_bit(BCH_FS_MAY_GO_RW, &c->flags);
 	set_bit(BCH_FS_FSCK_DONE, &c->flags);
 
 	for (i = 0; i < BTREE_ID_NR; i++)
@@ -1329,6 +1369,7 @@ int bch2_fs_initialize(struct bch_fs *c)
 	 * Write out the superblock and journal buckets, now that we can do
 	 * btree updates
 	 */
+	bch_verbose(c, "marking superblocks");
 	err = "error marking superblock and journal";
 	for_each_member_device(ca, c, i) {
 		ret = bch2_trans_mark_dev_sb(c, ca);
@@ -1339,6 +1380,12 @@ int bch2_fs_initialize(struct bch_fs *c)
 
 		ca->new_fs_bucket_idx = 0;
 	}
+
+	bch_verbose(c, "initializing freespace");
+	err = "error initializing freespace";
+	ret = bch2_fs_freespace_init(c);
+	if (ret)
+		goto err;
 
 	err = "error creating root snapshot node";
 	ret = bch2_fs_initialize_subvolumes(c);

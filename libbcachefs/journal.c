@@ -153,11 +153,6 @@ static bool __journal_entry_close(struct journal *j)
 			return true;
 		}
 
-		if (!test_bit(JOURNAL_NEED_WRITE, &j->flags)) {
-			set_bit(JOURNAL_NEED_WRITE, &j->flags);
-			j->need_write_time = local_clock();
-		}
-
 		new.cur_entry_offset = JOURNAL_ENTRY_CLOSED_VAL;
 		new.idx++;
 
@@ -217,16 +212,24 @@ static bool __journal_entry_close(struct journal *j)
 static bool journal_entry_want_write(struct journal *j)
 {
 	union journal_res_state s = READ_ONCE(j->reservations);
+	struct journal_buf *buf = journal_cur_buf(j);
 	bool ret = false;
+
+	buf->expires = jiffies;
+
+	if (!test_bit(JOURNAL_NEED_WRITE, &j->flags)) {
+		set_bit(JOURNAL_NEED_WRITE, &j->flags);
+		j->need_write_time = local_clock();
+	}
 
 	/*
 	 * Don't close it yet if we already have a write in flight, but do set
 	 * NEED_WRITE:
 	 */
-	if (s.idx != s.unwritten_idx)
-		set_bit(JOURNAL_NEED_WRITE, &j->flags);
-	else
+	if (s.idx == s.unwritten_idx)
 		ret = __journal_entry_close(j);
+	else
+		set_bit(JOURNAL_NEED_WRITE, &j->flags);
 
 	return ret;
 }
@@ -273,6 +276,8 @@ static int journal_entry_open(struct journal *j)
 
 	BUG_ON(!j->cur_entry_sectors);
 
+	buf->expires		= jiffies +
+		msecs_to_jiffies(c->opts.journal_flush_delay);
 	buf->u64s_reserved	= j->entry_u64s_reserved;
 	buf->disk_sectors	= j->cur_entry_sectors;
 	buf->sectors		= min(buf->disk_sectors, buf->buf_size >> 9);
@@ -334,8 +339,19 @@ static void journal_quiesce(struct journal *j)
 static void journal_write_work(struct work_struct *work)
 {
 	struct journal *j = container_of(work, struct journal, write_work.work);
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+	struct journal_buf *buf;
+	long delta;
 
-	journal_entry_close(j);
+	spin_lock(&j->lock);
+	buf = journal_cur_buf(j);
+	delta = buf->expires - jiffies;
+
+	if (delta > 0)
+		mod_delayed_work(c->io_complete_wq, &j->write_work, delta);
+	else
+		__journal_entry_close(j);
+	spin_unlock(&j->lock);
 }
 
 static int __journal_res_get(struct journal *j, struct journal_res *res,
@@ -417,7 +433,7 @@ unlock:
 	    (flags & JOURNAL_RES_GET_RESERVED)) {
 		char *journal_debug_buf = kmalloc(4096, GFP_ATOMIC);
 
-		bch_err(c, "Journal stuck!");
+		bch_err(c, "Journal stuck! Hava a pre-reservation but journal full");
 		if (journal_debug_buf) {
 			bch2_journal_debug_to_text(&_PBUF(journal_debug_buf, 4096), j);
 			bch_err(c, "%s", journal_debug_buf);
@@ -654,6 +670,7 @@ int bch2_journal_meta(struct journal *j)
 
 	buf = j->buf + (res.seq & JOURNAL_BUF_MASK);
 	buf->must_flush = true;
+	buf->expires	= jiffies;
 	set_bit(JOURNAL_NEED_WRITE, &j->flags);
 
 	bch2_journal_res_put(j, &res);
@@ -819,10 +836,8 @@ static int __bch2_set_nr_journal_buckets(struct bch_dev *ca, unsigned nr,
 				goto err;
 			}
 		} else {
-			rcu_read_lock();
 			ob = bch2_bucket_alloc(c, ca, RESERVE_NONE,
 					       false, cl);
-			rcu_read_unlock();
 			if (IS_ERR(ob)) {
 				ret = cl ? -EAGAIN : -ENOSPC;
 				goto err;
@@ -1287,6 +1302,10 @@ void bch2_journal_pins_to_text(struct printbuf *out, struct journal *j)
 	fifo_for_each_entry_ptr(pin_list, &j->pin, i) {
 		pr_buf(out, "%llu: count %u\n",
 		       i, atomic_read(&pin_list->count));
+
+		list_for_each_entry(pin, &pin_list->key_cache_list, list)
+			pr_buf(out, "\t%px %ps\n",
+			       pin, pin->flush);
 
 		list_for_each_entry(pin, &pin_list->list, list)
 			pr_buf(out, "\t%px %ps\n",

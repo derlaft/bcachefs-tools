@@ -34,10 +34,8 @@ unsigned bch2_journal_dev_buckets_available(struct journal *j,
 					    struct journal_device *ja,
 					    enum journal_space_from from)
 {
-	unsigned available = !test_bit(JOURNAL_NOCHANGES, &j->flags)
-		? ((journal_space_from(ja, from) -
-		    ja->cur_idx - 1 + ja->nr) % ja->nr)
-		: ja->nr;
+	unsigned available = (journal_space_from(ja, from) -
+			      ja->cur_idx - 1 + ja->nr) % ja->nr;
 
 	/*
 	 * Don't use the last bucket unless writing the new last_seq
@@ -457,6 +455,8 @@ journal_get_next_pin(struct journal *j,
 	struct journal_entry_pin_list *pin_list;
 	struct journal_entry_pin *ret = NULL;
 
+	max_seq = min(max_seq, journal_last_seq(j) + j->pin.size / 64);
+
 	fifo_for_each_entry_ptr(pin_list, &j->pin, *seq) {
 		if (*seq > max_seq && !get_any && !get_key_cache)
 			break;
@@ -767,7 +767,8 @@ static int journal_flush_done(struct journal *j, u64 seq_to_flush,
 
 	mutex_lock(&j->reclaim_lock);
 
-	*did_work = journal_flush_pins(j, seq_to_flush, 0, 0) != 0;
+	if (journal_flush_pins(j, seq_to_flush, 0, 0))
+		*did_work = true;
 
 	spin_lock(&j->lock);
 	/*

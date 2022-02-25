@@ -25,6 +25,7 @@ struct journal_buf {
 
 	struct closure_waitlist	wait;
 	u64			last_seq;	/* copy of data->last_seq */
+	unsigned long		expires;
 
 	unsigned		buf_size;	/* size in bytes of @data */
 	unsigned		sectors;	/* maximum size for current entry */
@@ -151,7 +152,6 @@ enum {
 	JOURNAL_NEED_WRITE,
 	JOURNAL_MAY_GET_UNRESERVED,
 	JOURNAL_MAY_SKIP_FLUSH,
-	JOURNAL_NOCHANGES,
 };
 
 /* Embedded in struct bch_fs */
